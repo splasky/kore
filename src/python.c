@@ -55,8 +55,31 @@
 
 #include <frameobject.h>
 
+/*
+ * Python 3.13.x requires that Py_BUILD_CORE is defined before we pull
+ * in the pycore_frame header file, and it loves using unnamed unions
+ * so we have to turn off pendatic mode before including it.
+ *
+ * The f_code member was removed from _PyInterpreterFrame and is replaced
+ * with a PyObject called f_executable. There is an _PyFrame_GetCode()
+ * helper function now.
+ */
+#if PY_VERSION_HEX >= 0x030d0000
+#define Py_BUILD_CORE			1
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored		"-Wpedantic"
+#endif
+
+#if PY_VERSION_HEX < 0x030d0000
+#define _PyFrame_GetCode(frame)		(frame->f_code)
+#endif
+
 #if PY_VERSION_HEX >= 0x030b0000
 #include <internal/pycore_frame.h>
+#endif
+
+#if PY_VERSION_HEX >= 0x030d0000
+#pragma GCC diagnostic pop
 #endif
 
 #if PY_VERSION_HEX < 0x030A0000
@@ -170,7 +193,7 @@ static int	python_validator_check(PyObject *);
 static int	python_runtime_resolve(const char *, const struct stat *);
 static int	python_runtime_http_request(void *, struct http_request *);
 static void	python_runtime_http_request_free(void *, struct http_request *);
-static void	python_runtime_http_body_chunk(void *, struct http_request *,
+static int	python_runtime_http_body_chunk(void *, struct http_request *,
 		    const void *, size_t);
 static int	python_runtime_validator(void *, struct http_request *,
 		    const void *);
@@ -1201,7 +1224,7 @@ python_resolve_frame_line(void *ptr)
 
 	frame = ptr;
 	addr = _PyInterpreterFrame_LASTI(frame) * sizeof(_Py_CODEUNIT);
-	line = PyCode_Addr2Line(frame->f_code, addr);
+	line = PyCode_Addr2Line(_PyFrame_GetCode(frame), addr);
 #else
 	line = PyFrame_GetLineNumber(ptr);
 #endif
@@ -1232,8 +1255,8 @@ python_coro_trace(const char *label, struct python_coro *coro)
 #else
 	frame = obj->cr_frame;
 #endif
-	if (frame != NULL && frame->f_code != NULL) {
-		code = frame->f_code;
+	if (frame != NULL && _PyFrame_GetCode(frame) != NULL) {
+		code = _PyFrame_GetCode(frame);
 		func = PyUnicode_AsUTF8AndSize(code->co_name, NULL);
 		file = PyUnicode_AsUTF8AndSize(code->co_filename, NULL);
 
@@ -1447,10 +1470,11 @@ python_runtime_http_request_free(void *addr, struct http_request *req)
 	Py_XDECREF(ret);
 }
 
-static void
+static int
 python_runtime_http_body_chunk(void *addr, struct http_request *req,
     const void *data, size_t len)
 {
+	int		result;
 	PyObject	*args, *ret;
 
 	if (req->py_req == NULL) {
@@ -1460,7 +1484,7 @@ python_runtime_http_body_chunk(void *addr, struct http_request *req,
 
 	if ((args = Py_BuildValue("(Oy#)", req->py_req, data, len)) == NULL) {
 		kore_python_log_error("python_runtime_http_body_chunk");
-		return;
+		return (KORE_RESULT_ERROR);
 	}
 
 	PyErr_Clear();
@@ -1469,8 +1493,15 @@ python_runtime_http_body_chunk(void *addr, struct http_request *req,
 	if (ret == NULL)
 		kore_python_log_error("python_runtime_http_body_chunk");
 
+	if (ret == Py_True)
+		result = KORE_RESULT_OK;
+	else
+		result = KORE_RESULT_ERROR;
+
 	Py_XDECREF(ret);
 	Py_DECREF(args);
+
+	return (result);
 }
 
 static int
@@ -3163,9 +3194,10 @@ static void
 pytimer_run(void *arg, u_int64_t now)
 {
 	PyObject		*ret;
-	struct pytimer		*timer = arg;
 	struct kore_timer	*run;
+	struct pytimer		*timer;
 
+	timer = arg;
 	run = timer->run;
 	timer->run = NULL;
 
