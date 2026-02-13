@@ -22,6 +22,15 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+/*
+ * Extremely ugly hack to get past glibc 2.43 its insane implementation
+ * of C23 features shoved down a C99 code base.
+ */
+#if defined(__GLIBC__)
+#undef __GLIBC_USE_ISOC23
+#include <string.h>
+#endif
+
 #if !defined(KODEV_MINIMAL)
 #include <openssl/err.h>
 #include <openssl/pem.h>
