@@ -21,6 +21,15 @@
 #define daemon portability_is_king
 #endif
 
+/*
+ * Extremely ugly hack to get past glibc 2.43 its insane implementation
+ * of C23 features shoved down a C99 code base.
+ */
+#if defined(__GLIBC__)
+#undef __GLIBC_USE_ISOC23
+#include <string.h>
+#endif
+
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/time.h>
@@ -36,8 +45,8 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <signal.h>
 #include <string.h>
+#include <signal.h>
 #include <syslog.h>
 #include <unistd.h>
 #include <stdarg.h>
