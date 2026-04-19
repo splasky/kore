@@ -16,7 +16,9 @@
 
 #include <sys/param.h>
 #include <sys/mman.h>
+#if !defined(KORE_USE_IO_URING)
 #include <sys/epoll.h>
+#endif
 #include <sys/ptrace.h>
 #include <sys/prctl.h>
 #include <sys/user.h>
@@ -160,12 +162,28 @@ static struct sock_filter filter_kore[] = {
 	KORE_SYSCALL_ALLOW(recv),
 #endif
 	KORE_SYSCALL_ALLOW(recvfrom),
-	KORE_SYSCALL_ALLOW(epoll_ctl),
+	KORE_SYSCALL_ALLOW(recvmsg),
+	KORE_SYSCALL_ALLOW(sendmsg),
 	KORE_SYSCALL_ALLOW(setsockopt),
+
+#if defined(KORE_USE_IO_URING)
+	/* io_uring syscalls for the uring-based event loop. */
+#if defined(SYS_io_uring_setup)
+	KORE_SYSCALL_ALLOW(io_uring_setup),
+#endif
+#if defined(SYS_io_uring_enter)
+	KORE_SYSCALL_ALLOW(io_uring_enter),
+#endif
+#if defined(SYS_io_uring_register)
+	KORE_SYSCALL_ALLOW(io_uring_register),
+#endif
+#else
+	KORE_SYSCALL_ALLOW(epoll_ctl),
 #if defined(SYS_epoll_wait)
 	KORE_SYSCALL_ALLOW(epoll_wait),
 #endif
 	KORE_SYSCALL_ALLOW(epoll_pwait),
+#endif /* KORE_USE_IO_URING */
 
 	/* Signal related. */
 	KORE_SYSCALL_ALLOW(sigaltstack),

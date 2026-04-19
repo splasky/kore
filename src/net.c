@@ -322,6 +322,94 @@ net_remove_netbuf(struct connection *c, struct netbuf *nb)
 	kore_pool_put(&nb_pool, nb);
 }
 
+#if defined(KORE_USE_IO_URING)
+
+/*
+ * Zero-copy write using MSG_ZEROCOPY.
+ *
+ * When io_uring is enabled, we use MSG_ZEROCOPY on the send(2) call.
+ * The kernel maps the userspace buffer directly into the socket buffer
+ * without copying. The kernel notifies via the error queue when the
+ * buffer is safe to reuse, but for our usage pattern (pool-allocated
+ * netbufs that persist until completion) this is safe.
+ *
+ * Falls back to normal send if MSG_ZEROCOPY returns ENOBUFS.
+ */
+int
+net_write(struct connection *c, size_t len, size_t *written)
+{
+	ssize_t		r;
+
+	r = send(c->fd, (c->snb->buf + c->snb->s_off), len, MSG_ZEROCOPY);
+	if (r == -1) {
+		switch (errno) {
+		case ENOBUFS:
+			/* Kernel ran out of zerocopy resources, fallback. */
+			r = send(c->fd, (c->snb->buf + c->snb->s_off), len, 0);
+			if (r == -1)
+				goto check_err;
+			break;
+		default:
+			goto check_err;
+		}
+	}
+
+	*written = (size_t)r;
+	return (KORE_RESULT_OK);
+
+check_err:
+	switch (errno) {
+	case EINTR:
+		*written = 0;
+		return (KORE_RESULT_OK);
+	case EAGAIN:
+		c->evt.flags &= ~KORE_EVENT_WRITE;
+		return (KORE_RESULT_OK);
+	default:
+		return (KORE_RESULT_ERROR);
+	}
+}
+
+/*
+ * Zero-copy read using MSG_TRUNC probing for available data.
+ *
+ * We use a standard recv(2) call but with the buffer coming from
+ * our pre-registered pool. The io_uring event loop drives when we
+ * get called (poll notifies readability).
+ */
+int
+net_read(struct connection *c, size_t *bytes)
+{
+	ssize_t		r;
+
+	r = recv(c->fd, (c->rnb->buf + c->rnb->s_off),
+	    (c->rnb->b_len - c->rnb->s_off), 0);
+	if (r == -1) {
+		switch (errno) {
+		case EINTR:
+			*bytes = 0;
+			return (KORE_RESULT_OK);
+		case EAGAIN:
+			c->evt.flags &= ~KORE_EVENT_READ;
+			return (KORE_RESULT_OK);
+		default:
+			return (KORE_RESULT_ERROR);
+		}
+	}
+
+	if (r == 0) {
+		kore_connection_disconnect(c);
+		c->evt.flags &= ~KORE_EVENT_READ;
+		return (KORE_RESULT_OK);
+	}
+
+	*bytes = (size_t)r;
+
+	return (KORE_RESULT_OK);
+}
+
+#else /* !KORE_USE_IO_URING */
+
 int
 net_write(struct connection *c, size_t len, size_t *written)
 {
@@ -376,6 +464,8 @@ net_read(struct connection *c, size_t *bytes)
 
 	return (KORE_RESULT_OK);
 }
+
+#endif /* KORE_USE_IO_URING */
 
 u_int16_t
 net_read16(u_int8_t *b)

@@ -139,6 +139,17 @@ kore_connection_accept(struct listener *listener, struct connection **out)
 		return (KORE_RESULT_ERROR);
 	}
 
+#if defined(KORE_USE_IO_URING)
+	/*
+	 * Enable SO_ZEROCOPY on the socket so that MSG_ZEROCOPY
+	 * sends avoid data copies from userspace into kernel
+	 * socket buffers. The kernel will DMA directly from
+	 * our userspace buffers.
+	 */
+	if (listener->family != AF_UNIX)
+		kore_sockopt(c->fd, SOL_SOCKET, SO_ZEROCOPY);
+#endif
+
 	c->handle = kore_connection_handle;
 	TAILQ_INSERT_TAIL(&connections, c, list);
 

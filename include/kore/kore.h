@@ -67,6 +67,10 @@ extern int daemon(int, int);
 #endif
 #endif
 
+#if defined(__linux__) && defined(KORE_USE_IO_URING)
+#include <liburing.h>
+#endif
+
 #if defined(__OpenBSD__)
 #define KORE_USE_PLATFORM_PLEDGE	1
 #endif
@@ -229,6 +233,34 @@ struct kore_event {
 	int		flags;
 	void		(*handle)(void *, int);
 } __attribute__((packed));
+
+#if defined(KORE_USE_IO_URING)
+
+/*
+ * User data tag encoded into io_uring SQE/CQE to identify
+ * the operation type when processing completions.
+ */
+#define KORE_URING_OP_ACCEPT	1
+#define KORE_URING_OP_RECV	2
+#define KORE_URING_OP_SEND	3
+#define KORE_URING_OP_SENDFILE	4
+#define KORE_URING_OP_POLL	5
+
+/*
+ * Encodes the operation type and a pointer into a single u64
+ * for io_uring user_data. The top 8 bits store the op type,
+ * the lower 56 bits store the pointer (sufficient for userspace).
+ */
+#define KORE_URING_UDATA(op, ptr)	\
+    (((u_int64_t)(op) << 56) | ((u_int64_t)(uintptr_t)(ptr) & 0x00ffffffffffffffULL))
+
+#define KORE_URING_UDATA_OP(ud)		((int)((ud) >> 56))
+#define KORE_URING_UDATA_PTR(ud)	((void *)(uintptr_t)((ud) & 0x00ffffffffffffffULL))
+
+void	kore_platform_uring_submit_recv(struct connection *);
+void	kore_platform_uring_submit_send(struct connection *);
+
+#endif /* KORE_USE_IO_URING */
 
 struct connection {
 	struct kore_event	evt;

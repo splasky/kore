@@ -166,6 +166,9 @@ ifeq ("$(OSNAME)", "darwin")
 else ifeq ("$(OSNAME)", "linux")
 	CFLAGS+=-D_GNU_SOURCE=1 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 	LDFLAGS+=-ldl
+	CFLAGS+=-DKORE_USE_IO_URING
+	LDFLAGS+=-luring
+	FEATURES+=-DKORE_USE_IO_URING
 	S_SRC+=src/linux.c src/seccomp.c
 else
 	S_SRC+=src/bsd.c
