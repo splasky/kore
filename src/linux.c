@@ -39,19 +39,47 @@
  * io_uring-based platform backend.
  *
  * Replaces the epoll event loop with io_uring for all I/O operations.
- * Uses multishot poll for listener fds and general fd monitoring,
- * and zero-copy send (IORING_OP_SEND_ZC) where supported.
+ * Uses multishot poll for POLLIN monitoring with generation-based
+ * CQE validation to safely handle fd reuse after connection teardown.
+ * POLLOUT is not monitored to avoid CQ flooding (the send queue is
+ * flushed synchronously after http_process).
  */
 
 static struct io_uring		ring;
 static int			ring_initialized = 0;
 
 /*
- * We use multishot poll on listener fds to get accept readiness,
- * and on connection fds to get read/write readiness. The event
- * loop processes CQEs and dispatches through the existing
- * kore_event callback mechanism.
+ * fd-indexed lookup table mapping file descriptors to their
+ * kore_event owner, poll event mask, and generation counter.
+ *
+ * The generation counter solves the multishot poll stale-CQE problem:
+ * when a connection is disconnected and its fd is reused by a new
+ * connection, the old multishot poll may still have CQEs in-flight.
+ * Each event_schedule increments the generation; CQEs carrying an
+ * old generation are silently skipped.
+ *
+ * This avoids using io_uring cancel operations entirely, which
+ * eliminates the race where cancel-by-fd accidentally cancels
+ * a new connection's poll that reused the same fd number.
  */
+#define FD_TABLE_SIZE		65536
+
+struct fd_entry {
+	void		*owner;
+	int		events;
+	u_int32_t	generation;
+};
+
+static struct fd_entry		fd_table[FD_TABLE_SIZE];
+
+/*
+ * Encode fd and generation into a single u64 for io_uring user_data.
+ * Lower 32 bits = fd, upper 32 bits = generation.
+ */
+#define UDATA_ENCODE(fd, gen)	\
+    (((u_int64_t)(gen) << 32) | ((u_int64_t)(u_int32_t)(fd)))
+#define UDATA_FD(ud)		((int)((ud) & 0xffffffffULL))
+#define UDATA_GEN(ud)		((u_int32_t)((ud) >> 32))
 
 void
 kore_platform_init(void)
@@ -103,6 +131,7 @@ void
 kore_platform_event_cleanup(void)
 {
 	if (ring_initialized) {
+		memset(fd_table, 0, sizeof(fd_table));
 		io_uring_queue_exit(&ring);
 		ring_initialized = 0;
 	}
@@ -114,10 +143,7 @@ kore_platform_event_wait(u_int64_t timer)
 	struct io_uring_cqe	*cqe;
 	struct __kernel_timespec	ts;
 	unsigned		head;
-	int			ret;
-	u_int64_t		ud;
-	int			op;
-	void			*ptr;
+	int			ret, fd;
 	struct kore_event	*evt;
 
 	if (timer == KORE_WAIT_INFINITE) {
@@ -133,105 +159,80 @@ kore_platform_event_wait(u_int64_t timer)
 		fatal("io_uring_submit_and_wait: %s", strerror(-ret));
 
 	io_uring_for_each_cqe(&ring, head, cqe) {
+		u_int64_t	ud;
+		u_int32_t	gen;
+
 		ud = io_uring_cqe_get_data64(cqe);
-		if (ud == 0)
+		fd = UDATA_FD(ud);
+		gen = UDATA_GEN(ud);
+
+		if (fd <= 0 || fd >= FD_TABLE_SIZE)
 			continue;
 
-		op = KORE_URING_UDATA_OP(ud);
-		ptr = KORE_URING_UDATA_PTR(ud);
-
-		if (ptr == NULL)
+		/*
+		 * Skip stale CQEs: either the fd has been
+		 * unregistered (owner == NULL) or the generation
+		 * doesn't match (fd was reused by a new connection).
+		 */
+		if (fd_table[fd].owner == NULL)
+			continue;
+		if (fd_table[fd].generation != gen)
 			continue;
 
-		evt = (struct kore_event *)ptr;
+		evt = (struct kore_event *)fd_table[fd].owner;
 
-		switch (op) {
-		case KORE_URING_OP_POLL:
-			if (cqe->res < 0) {
-				evt->handle(ptr, 1);
-				break;
-			}
+		if (cqe->res < 0) {
+			if (cqe->res != -ECANCELED)
+				evt->handle(fd_table[fd].owner, 1);
+			continue;
+		}
 
-			evt->flags &= ~(KORE_EVENT_READ | KORE_EVENT_WRITE);
+		evt->flags &= ~(KORE_EVENT_READ | KORE_EVENT_WRITE);
 
-			if (cqe->res & POLLIN)
-				evt->flags |= KORE_EVENT_READ;
-			if (cqe->res & POLLOUT)
-				evt->flags |= KORE_EVENT_WRITE;
-			if (cqe->res & (POLLERR | POLLHUP | POLLRDHUP)) {
-				evt->handle(ptr, 1);
-				break;
-			}
-
-			evt->handle(ptr, 0);
-
+		if (cqe->res & POLLIN) {
+			evt->flags |= KORE_EVENT_READ;
 			/*
-			 * If this was a multishot poll (listener or
-			 * persistent connection poll), it stays armed
-			 * unless IORING_CQE_F_MORE is not set.
+			 * Always set WRITE so net_send_flush() can
+			 * drain the send queue after http_process()
+			 * queues a response. We don't monitor POLLOUT
+			 * to avoid CQ flooding.
 			 */
-			if (!(cqe->flags & IORING_CQE_F_MORE)) {
-				/*
-				 * Multishot expired or was cancelled.
-				 * For connections, re-arm below if needed.
-				 */
-			}
-			break;
-		case KORE_URING_OP_ACCEPT:
-			/*
-			 * Handled via poll + traditional accept for now
-			 * to keep compatibility with the accept lock model.
-			 */
-			break;
-		case KORE_URING_OP_RECV:
-			if (cqe->res <= 0) {
-				evt->handle(ptr, 1);
-			} else {
-				evt->flags |= KORE_EVENT_READ;
-				evt->handle(ptr, 0);
-			}
-			break;
-		case KORE_URING_OP_SEND:
-			if (cqe->res < 0) {
-				evt->handle(ptr, 1);
-			} else {
-				evt->flags |= KORE_EVENT_WRITE;
-				evt->handle(ptr, 0);
-			}
-			break;
-		case KORE_URING_OP_SENDFILE:
-			if (cqe->res < 0) {
-				evt->handle(ptr, 1);
-			} else {
-				evt->flags |= KORE_EVENT_WRITE;
-				evt->handle(ptr, 0);
-			}
-			break;
-		default:
-			break;
+			evt->flags |= KORE_EVENT_WRITE;
+		}
+		if (cqe->res & POLLOUT)
+			evt->flags |= KORE_EVENT_WRITE;
+
+		if (cqe->res & (POLLERR | POLLHUP | POLLRDHUP)) {
+			evt->handle(fd_table[fd].owner, 1);
+		} else {
+			evt->handle(fd_table[fd].owner, 0);
 		}
 	}
 
 	io_uring_cq_advance(&ring, io_uring_cq_ready(&ring));
 }
 
-/*
- * Submit a multishot poll for both read and write events.
- * Uses IORING_POLL_ADD_MULTI so the poll stays armed across
- * multiple completions.
- */
 void
 kore_platform_event_all(int fd, void *c)
 {
+	/*
+	 * Only monitor POLLIN. POLLOUT is not monitored because
+	 * io_uring multishot poll is level-triggered, which would
+	 * flood the CQ with continuous POLLOUT CQEs (the socket
+	 * buffer is almost always writable). Instead, we set
+	 * KORE_EVENT_WRITE on every POLLIN delivery so that
+	 * net_send_flush() can run when the connection handler
+	 * or http_process() calls it.
+	 */
 	kore_platform_event_schedule(fd,
-	    POLLIN | POLLOUT | POLLRDHUP, IORING_POLL_ADD_MULTI, c);
+	    POLLIN | POLLRDHUP, IORING_POLL_ADD_MULTI, c);
 }
 
 void
 kore_platform_event_level_all(int fd, void *c)
 {
 	kore_platform_event_schedule(fd,
-	    POLLIN | POLLOUT | POLLRDHUP, IORING_POLL_ADD_MULTI, c);
+	    POLLIN | POLLRDHUP, IORING_POLL_ADD_MULTI, c);
 }
 
 void
@@ -246,6 +247,13 @@ kore_platform_event_schedule(int fd, int type, int flags, void *udata)
 {
 	struct io_uring_sqe	*sqe;
 
+	if (fd < 0 || fd >= FD_TABLE_SIZE)
+		fatal("fd %d out of fd_table range", fd);
+
+	fd_table[fd].owner = udata;
+	fd_table[fd].events = type;
+	fd_table[fd].generation++;
+
 	sqe = io_uring_get_sqe(&ring);
 	if (sqe == NULL)
 		fatal("io_uring_get_sqe(): ring full");
@@ -256,45 +264,51 @@ kore_platform_event_schedule(int fd, int type, int flags, void *udata)
 		sqe->len |= IORING_POLL_ADD_MULTI;
 
 	io_uring_sqe_set_data64(sqe,
-	    KORE_URING_UDATA(KORE_URING_OP_POLL, udata));
+	    UDATA_ENCODE(fd, fd_table[fd].generation));
 }
 
 void
 kore_platform_schedule_read(int fd, void *data)
 {
-	kore_platform_event_schedule(fd,
-	    POLLIN, IORING_POLL_ADD_MULTI, data);
+	kore_platform_event_schedule(fd, POLLIN, IORING_POLL_ADD_MULTI, data);
 }
 
 void
 kore_platform_schedule_write(int fd, void *data)
 {
-	kore_platform_event_schedule(fd,
-	    POLLOUT, IORING_POLL_ADD_MULTI, data);
+	kore_platform_event_schedule(fd, POLLOUT, IORING_POLL_ADD_MULTI, data);
 }
 
 void
 kore_platform_disable_read(int fd)
 {
 	struct io_uring_sqe	*sqe;
+	u_int64_t		ud;
 
-	sqe = io_uring_get_sqe(&ring);
-	if (sqe == NULL)
-		fatal("io_uring_get_sqe(): ring full");
-
-	io_uring_prep_poll_remove(sqe, 0);
-	io_uring_sqe_set_data64(sqe, 0);
+	if (fd < 0 || fd >= FD_TABLE_SIZE)
+		return;
 
 	/*
-	 * Poll removal is best-effort. The multishot may have
-	 * already completed. We cancel all polls for this fd
-	 * by submitting a cancel with IORING_ASYNC_CANCEL_FD.
+	 * Cancel the multishot poll by its exact user_data value
+	 * (fd + generation). This ensures we only cancel THIS
+	 * poll, not a new poll on a reused fd with a different
+	 * generation. The generation check in event_wait provides
+	 * a second safety net for any CQEs that arrive between
+	 * clearing the table and the cancel taking effect.
 	 */
+	ud = UDATA_ENCODE(fd, fd_table[fd].generation);
+
+	fd_table[fd].owner = NULL;
+	fd_table[fd].events = 0;
+
+	if (!ring_initialized)
+		return;
+
 	sqe = io_uring_get_sqe(&ring);
 	if (sqe == NULL)
 		return;
 
-	io_uring_prep_cancel_fd(sqe, fd, 0);
+	io_uring_prep_cancel64(sqe, ud, 0);
 	io_uring_sqe_set_data64(sqe, 0);
 }
 
@@ -328,58 +342,6 @@ void
 kore_platform_proctitle(const char *title)
 {
 	kore_proctitle(title);
-}
-
-/*
- * Submit a zero-copy send via io_uring for the given connection's
- * current send buffer.
- */
-void
-kore_platform_uring_submit_send(struct connection *c)
-{
-	struct io_uring_sqe	*sqe;
-	struct netbuf		*nb;
-	size_t			len, smin;
-
-	nb = TAILQ_FIRST(&(c->send_queue));
-	if (nb == NULL)
-		return;
-
-	smin = nb->b_len - nb->s_off;
-	len = MIN(NETBUF_SEND_PAYLOAD_MAX, smin);
-
-	sqe = io_uring_get_sqe(&ring);
-	if (sqe == NULL)
-		return;
-
-	io_uring_prep_send_zc(sqe, c->fd, nb->buf + nb->s_off, len, 0, 0);
-	io_uring_sqe_set_data64(sqe,
-	    KORE_URING_UDATA(KORE_URING_OP_SEND, c));
-}
-
-/*
- * Submit a recv via io_uring for the given connection's recv buffer.
- */
-void
-kore_platform_uring_submit_recv(struct connection *c)
-{
-	struct io_uring_sqe	*sqe;
-	size_t			len;
-
-	if (c->rnb == NULL || c->rnb->buf == NULL)
-		return;
-
-	len = c->rnb->b_len - c->rnb->s_off;
-	if (len == 0)
-		return;
-
-	sqe = io_uring_get_sqe(&ring);
-	if (sqe == NULL)
-		return;
-
-	io_uring_prep_recv(sqe, c->fd, c->rnb->buf + c->rnb->s_off, len, 0);
-	io_uring_sqe_set_data64(sqe,
-	    KORE_URING_UDATA(KORE_URING_OP_RECV, c));
 }
 
 #if defined(KORE_USE_PLATFORM_SENDFILE)

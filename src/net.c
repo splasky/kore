@@ -340,19 +340,9 @@ net_write(struct connection *c, size_t len, size_t *written)
 {
 	ssize_t		r;
 
-	r = send(c->fd, (c->snb->buf + c->snb->s_off), len, MSG_ZEROCOPY);
-	if (r == -1) {
-		switch (errno) {
-		case ENOBUFS:
-			/* Kernel ran out of zerocopy resources, fallback. */
-			r = send(c->fd, (c->snb->buf + c->snb->s_off), len, 0);
-			if (r == -1)
-				goto check_err;
-			break;
-		default:
-			goto check_err;
-		}
-	}
+	r = send(c->fd, (c->snb->buf + c->snb->s_off), len, 0);
+	if (r == -1)
+		goto check_err;
 
 	*written = (size_t)r;
 	return (KORE_RESULT_OK);

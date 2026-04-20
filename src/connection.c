@@ -139,16 +139,14 @@ kore_connection_accept(struct listener *listener, struct connection **out)
 		return (KORE_RESULT_ERROR);
 	}
 
-#if defined(KORE_USE_IO_URING)
 	/*
-	 * Enable SO_ZEROCOPY on the socket so that MSG_ZEROCOPY
-	 * sends avoid data copies from userspace into kernel
-	 * socket buffers. The kernel will DMA directly from
-	 * our userspace buffers.
+	 * Note: SO_ZEROCOPY / MSG_ZEROCOPY disabled for now.
+	 * Zerocopy sends require reading completion notifications
+	 * from the error queue (recvmsg MSG_ERRQUEUE), which kore
+	 * does not currently implement. Without draining the error
+	 * queue, the notification buffer fills and sends start
+	 * failing under sustained load.
 	 */
-	if (listener->family != AF_UNIX)
-		kore_sockopt(c->fd, SOL_SOCKET, SO_ZEROCOPY);
-#endif
 
 	c->handle = kore_connection_handle;
 	TAILQ_INSERT_TAIL(&connections, c, list);
@@ -234,6 +232,15 @@ kore_connection_disconnect(struct connection *c)
 {
 	if (c->state != CONN_STATE_DISCONNECTING) {
 		c->state = CONN_STATE_DISCONNECTING;
+
+#if defined(KORE_USE_IO_URING)
+		/*
+		 * Cancel any pending io_uring polls for this fd
+		 * before freeing the connection, to prevent
+		 * use-after-free from stale CQE delivery.
+		 */
+		kore_platform_disable_read(c->fd);
+#endif
 		if (c->disconnect)
 			c->disconnect(c);
 
