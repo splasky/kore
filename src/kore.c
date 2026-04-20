@@ -824,30 +824,30 @@ kore_server_start(int argc, char *argv[])
 		    __progname, kore_version, kore_build_date);
 		kore_log(LOG_INFO, "memory pool protections: %s",
 		    kore_mem_guard ? "enabled" : "disabled");
-		kore_log(LOG_INFO, "built-ins: "
+		kore_log(LOG_INFO, "built-ins:"
 #if defined(__linux__)
-		    "seccomp "
+		    " seccomp"
 #endif
 #if defined(KORE_USE_PGSQL)
-		    "pgsql "
+		    " pgsql"
 #endif
 #if defined(KORE_USE_TASKS)
-		    "tasks "
+		    " tasks"
 #endif
 #if defined(KORE_USE_JSONRPC)
-		    "jsonrpc "
+		    " jsonrpc"
 #endif
 #if defined(KORE_USE_PYTHON)
-		    "python "
+		    " python"
 #endif
 #if defined(KORE_USE_ACME)
-		    "acme "
+		    " acme"
 #endif
 #if defined(KORE_USE_CURL)
-		    "curl "
+		    " curl"
 #endif
 #if defined(KORE_USE_LUA)
-		    "lua "
+		    " lua"
 #endif
 		);
 	}
